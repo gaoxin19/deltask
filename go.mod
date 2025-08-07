@@ -1,6 +1,6 @@
 module github.com/gaoxin19/deltask
 
-go 1.23.11
+go 1.23
 
 require (
 	github.com/google/uuid v1.6.0
