@@ -97,13 +97,13 @@ func (w *Worker) Run(ctx context.Context) error {
 				case <-workerCtx.Done():
 					w.logger.Info("Worker shutting down", zap.Int("worker_id", workerID))
 					return
-				case task, ok := <-msgChan:
+				case t, ok := <-msgChan:
 					if !ok {
 						w.logger.Info("Worker stopping, message channel closed", zap.Int("worker_id", workerID))
 						return
 					}
 					// 使用worker上下文，允许任务取消
-					w.processTask(workerCtx, task)
+					w.processTask(workerCtx, t)
 				}
 			}
 		}(i + 1)
@@ -124,62 +124,62 @@ func (w *Worker) Stop() {
 	}
 }
 
-func (w *Worker) processTask(ctx context.Context, task *task.Task) {
-	handler, ok := w.registry[task.Name]
+func (w *Worker) processTask(ctx context.Context, t *task.Task) {
+	handler, ok := w.registry[t.Name]
 	if !ok {
-		w.handleUnknownTask(ctx, task)
+		w.handleUnknownTask(ctx, t)
 		return
 	}
 
-	w.logTaskStart(task)
+	w.logTaskStart(t)
 
-	_, err := handler(ctx, task.Payload)
+	_, err := handler(ctx, t.Payload)
 	if err != nil {
-		w.logTaskFailure(task, err)
-		w.handleTaskFailure(ctx, task, err)
+		w.logTaskFailure(t, err)
+		w.handleTaskFailure(ctx, t, err)
 	} else {
-		w.handleTaskSuccess(ctx, task)
+		w.handleTaskSuccess(ctx, t)
 	}
 }
 
 // handleUnknownTask 处理未注册的任务
-func (w *Worker) handleUnknownTask(ctx context.Context, task *task.Task) {
+func (w *Worker) handleUnknownTask(ctx context.Context, t *task.Task) {
 	w.logger.Error("No handler registered for task",
-		zap.String("task_name", task.Name),
-		zap.String("task_id", task.ID))
-	if err := w.broker.Nack(ctx, task, false); err != nil { // 不重入队列，直接丢弃
+		zap.String("task_name", t.Name),
+		zap.String("task_id", t.ID))
+	if err := w.broker.Nack(ctx, t, false); err != nil { // 不重入队列，直接丢弃
 		w.logger.Error("Failed to Nack unknown task",
-			zap.String("task_id", task.ID),
+			zap.String("task_id", t.ID),
 			zap.Error(err))
 	}
 }
 
 // handleTaskSuccess 处理任务成功完成
-func (w *Worker) handleTaskSuccess(ctx context.Context, task *task.Task) {
+func (w *Worker) handleTaskSuccess(ctx context.Context, t *task.Task) {
 	w.logger.Info("Task completed",
-		zap.String("task_name", task.Name),
-		zap.String("task_id", task.ID))
-	if err := w.broker.Ack(ctx, task); err != nil {
+		zap.String("task_name", t.Name),
+		zap.String("task_id", t.ID))
+	if err := w.broker.Ack(ctx, t); err != nil {
 		w.logger.Error("Failed to Ack successful task",
-			zap.String("task_id", task.ID),
+			zap.String("task_id", t.ID),
 			zap.Error(err))
 	}
 }
 
 // logTaskStart 记录任务开始处理的日志
-func (w *Worker) logTaskStart(task *task.Task) {
+func (w *Worker) logTaskStart(t *task.Task) {
 	w.logger.Info("Processing task",
-		zap.String("task_name", task.Name),
-		zap.String("task_id", task.ID),
-		zap.Int("retry", task.Retry),
+		zap.String("task_name", t.Name),
+		zap.String("task_id", t.ID),
+		zap.Int("retry", t.Retry),
 		zap.Int("max_retries", w.retryPolicy.MaxRetries))
 }
 
 // logTaskFailure 记录任务失败的日志
-func (w *Worker) logTaskFailure(task *task.Task, err error) {
+func (w *Worker) logTaskFailure(t *task.Task, err error) {
 	w.logger.Error("Task failed",
-		zap.String("task_name", task.Name),
-		zap.String("task_id", task.ID),
+		zap.String("task_name", t.Name),
+		zap.String("task_id", t.ID),
 		zap.Error(err))
 }
 
