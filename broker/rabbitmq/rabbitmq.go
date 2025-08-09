@@ -26,6 +26,9 @@ const (
 type Config struct {
 	URL       string // AMQP 连接 URL, e.g., "amqp://guest:guest@localhost:5672/my_vhost"
 	Namespace string // 用于隔离资源的命名空间，如 "billing" 或 "notifications"
+	// Prefetch 是消费端 QoS 预取数量。用于限制单个消费者在未确认前最多持有的消息数。
+	// 设置更大的值有助于提高吞吐。若小于等于 0，则使用默认值 1。
+	Prefetch int
 }
 
 // rabbitBroker 实现了 broker.Broker 接口
@@ -53,6 +56,10 @@ func NewBrokerWithLogger(config Config, log *logger.Logger) (broker.Broker, erro
 	}
 	if log == nil {
 		log = logger.NewProductionLogger()
+	}
+
+	if config.Prefetch <= 0 {
+		config.Prefetch = 1
 	}
 
 	b := &rabbitBroker{
@@ -198,9 +205,9 @@ func (b *rabbitBroker) Consume(ctx context.Context, queueName string) (<-chan *t
 		return nil, fmt.Errorf("failed to bind queue '%s': %w", prefixedQueueName, err)
 	}
 
-	// 设置QoS, 确保worker在确认前只接收一个消息，防止消息丢失
-	if err := b.channel.Qos(1, 0, false); err != nil {
-		return nil, fmt.Errorf("failed to set QoS: %w", err)
+	// 设置 QoS 预取数量（prefetch），默认 1，可通过 Config 覆盖。
+	if err := b.channel.Qos(b.config.Prefetch, 0, false); err != nil {
+		return nil, fmt.Errorf("failed to set QoS (prefetch=%d): %w", b.config.Prefetch, err)
 	}
 
 	deliveries, err := b.channel.Consume(prefixedQueueName, "", false, false, false, false, nil)
