@@ -159,7 +159,7 @@ func TestNewWorkerWithLogger(t *testing.T) {
 	concurrency := 2
 	testLogger := logger.NewNopLogger()
 
-	worker := NewWorkerWithLogger(broker, queueName, concurrency, testLogger)
+	worker := NewWorker(broker, queueName, concurrency, WorkerOpts.WithLogger(testLogger))
 
 	if worker.w == nil {
 		t.Error("NewWorkerWithLogger() internal worker not created")

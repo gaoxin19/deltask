@@ -69,6 +69,10 @@ func (w *Worker) WithRetryPolicy(policy RetryPolicy) *Worker {
 	return w
 }
 
+func (w *Worker) QueueName() string {
+	return w.queueName
+}
+
 func (w *Worker) Register(taskName string, handler task.Handler) {
 	w.registry[taskName] = handler
 }

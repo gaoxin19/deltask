@@ -47,19 +47,66 @@ type Worker struct {
 	w *internal.Worker
 }
 
-// NewWorker 创建一个新的 Worker 实例。
-// concurrency 指定了并发处理任务的 goroutine 数量。
-func NewWorker(b broker.Broker, queueName string, concurrency int) *Worker {
-	return &Worker{
-		w: internal.NewWorker(b, queueName, concurrency),
+type RetryPolicy = internal.RetryPolicy
+
+// workerOptions 包含了 Worker 的所有可选配置项。
+type workerOptions struct {
+	logger      *logger.Logger
+	retryPolicy *internal.RetryPolicy
+}
+
+// WorkerOption 是一个函数类型，用于修改 workerOptions 结构体。
+type WorkerOption func(*workerOptions)
+
+// newWorkerOptions 创建一个带有默认值的 workerOptions 实例。
+func newWorkerOptions() *workerOptions {
+	defaultRetryPolicy := internal.DefaultRetryPolicy()
+	return &workerOptions{
+		logger:      logger.NewProductionLogger(),
+		retryPolicy: &defaultRetryPolicy,
 	}
 }
 
-// NewWorkerWithLogger 创建一个带有指定logger的 Worker 实例。
-// concurrency 指定了并发处理任务的 goroutine 数量。
-func NewWorkerWithLogger(b broker.Broker, queueName string, concurrency int, log *logger.Logger) *Worker {
+// WorkerOpts 包含 Worker 相关的配置选项。
+var WorkerOpts workerOptionBuilder
+
+type workerOptionBuilder struct{}
+
+// WithLogger 返回一个 WorkerOption，用于设置 Worker 的自定义 logger。
+func (workerOptionBuilder) WithLogger(l *logger.Logger) WorkerOption {
+	return func(o *workerOptions) {
+		o.logger = l
+	}
+}
+
+// WithRetryPolicy 返回一个 WorkerOption，用于设置 Worker 的重试策略。
+func (workerOptionBuilder) WithRetryPolicy(policy RetryPolicy) WorkerOption {
+	return func(o *workerOptions) {
+		o.retryPolicy = &policy
+	}
+}
+
+// NewWorker 创建一个新的 Worker 实例，使用 options 模式进行配置。
+// broker: 消息中间件实例
+// queueName: 队列名称
+// concurrency: 并发处理任务的 goroutine 数量
+// opts: 可选配置项
+func NewWorker(broker broker.Broker, queueName string, concurrency int, opts ...WorkerOption) *Worker {
+	cfg := newWorkerOptions()
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
+	// 创建内部 Worker
+	internalWorker := internal.NewWorkerWithLogger(broker, queueName, concurrency, cfg.logger)
+
+	// 应用重试策略
+	if cfg.retryPolicy != nil {
+		internalWorker.WithRetryPolicy(*cfg.retryPolicy)
+	}
+
 	return &Worker{
-		w: internal.NewWorkerWithLogger(b, queueName, concurrency, log),
+		w: internalWorker,
 	}
 }
 
@@ -73,4 +120,11 @@ func (w *Worker) Register(taskName string, handler task.Handler) {
 // 它会处理优雅关闭逻辑。
 func (w *Worker) Run(ctx context.Context) error {
 	return w.w.Run(ctx)
+}
+
+// Run 快速启动多个 Worker 实例，并处理关闭信号。
+// 这是一个便捷函数，内部使用 Manager 来管理 Worker 生命周期。
+func Run(ctx context.Context, workers []*Worker, opts ...ManagerOption) error {
+	manager := NewManager(workers, opts...)
+	return manager.Run(ctx)
 }
