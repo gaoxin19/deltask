@@ -82,7 +82,11 @@ func (w *Worker) Run(ctx context.Context) error {
 	workerCtx, cancel := context.WithCancel(ctx)
 	w.cancel = cancel
 
-	msgChan, err := w.broker.Consume(workerCtx, w.queueName)
+	brokerConsumeOptions := []broker.ConsumeOption{
+		broker.WithPrefetchCount(w.concurrency), // 设置预取数量与并发数一致
+	}
+
+	msgChan, err := w.broker.Consume(workerCtx, w.queueName, brokerConsumeOptions...)
 	if err != nil {
 		return fmt.Errorf("failed to start consuming: %w", err)
 	}

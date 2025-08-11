@@ -4,6 +4,7 @@ package testutil
 import (
 	"context"
 
+	"github.com/gaoxin19/deltask/broker"
 	"github.com/gaoxin19/deltask/task"
 )
 
@@ -57,7 +58,7 @@ func (m *MockBroker) Publish(ctx context.Context, t *task.Task, queueName string
 	return nil
 }
 
-func (m *MockBroker) Consume(ctx context.Context, queueName string) (<-chan *task.Task, error) {
+func (m *MockBroker) Consume(ctx context.Context, queueName string, opts ...broker.ConsumeOption) (<-chan *task.Task, error) {
 	m.ConsumeCalls = append(m.ConsumeCalls, ConsumeCall{
 		QueueName: queueName,
 	})

@@ -28,6 +28,7 @@ type Config struct {
 	Namespace string // 用于隔离资源的命名空间，如 "billing" 或 "notifications"
 	// Prefetch 是消费端 QoS 预取数量。用于限制单个消费者在未确认前最多持有的消息数。
 	// 设置更大的值有助于提高吞吐。若小于等于 0，则使用默认值 1。
+	// 设置该值作为默认值，可通过 ConsumeOption 覆盖。
 	Prefetch int
 }
 
@@ -186,9 +187,16 @@ func (b *rabbitBroker) Publish(ctx context.Context, t *task.Task, queueName stri
 }
 
 // Consume 实现了 Broker 接口的 Consume 方法
-func (b *rabbitBroker) Consume(ctx context.Context, queueName string) (<-chan *task.Task, error) {
+func (b *rabbitBroker) Consume(ctx context.Context, queueName string, opts ...broker.ConsumeOption) (<-chan *task.Task, error) {
 	if b.channel == nil {
 		return nil, errors.New("broker is not connected")
+	}
+
+	consumeOptions := &broker.ConsumeOptions{
+		PrefetchCount: b.config.Prefetch,
+	}
+	for _, opt := range opts {
+		opt(consumeOptions)
 	}
 
 	prefixedQueueName := b.prefixed(queueName)
@@ -205,9 +213,9 @@ func (b *rabbitBroker) Consume(ctx context.Context, queueName string) (<-chan *t
 		return nil, fmt.Errorf("failed to bind queue '%s': %w", prefixedQueueName, err)
 	}
 
-	// 设置 QoS 预取数量（prefetch），默认 1，可通过 Config 覆盖。
-	if err := b.channel.Qos(b.config.Prefetch, 0, false); err != nil {
-		return nil, fmt.Errorf("failed to set QoS (prefetch=%d): %w", b.config.Prefetch, err)
+	// 设置 QoS 预取数量（prefetch）
+	if err := b.channel.Qos(consumeOptions.PrefetchCount, 0, false); err != nil {
+		return nil, fmt.Errorf("failed to set QoS (prefetch=%d): %w", consumeOptions.PrefetchCount, err)
 	}
 
 	deliveries, err := b.channel.Consume(prefixedQueueName, "", false, false, false, false, nil)
