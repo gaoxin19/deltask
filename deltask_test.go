@@ -2,9 +2,12 @@ package deltask
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
+	taskcontext "github.com/gaoxin19/deltask/context"
 	"github.com/gaoxin19/deltask/logger"
 	"github.com/gaoxin19/deltask/task"
 	"github.com/gaoxin19/deltask/testutil"
@@ -12,29 +15,61 @@ import (
 
 func TestNewTask(t *testing.T) {
 	payload := map[string]any{"key": "value", "number": 42}
-	task := NewTask("test-task", payload)
 
-	if task.Name != "test-task" {
-		t.Errorf("NewTask() Name = %v, want 'test-task'", task.Name)
-	}
+	t.Run("basic task creation", func(t *testing.T) {
+		task := NewTask("test-task", payload)
 
-	if len(task.Payload) != len(payload) {
-		t.Errorf("NewTask() payload length = %v, want %v", len(task.Payload), len(payload))
-	}
-
-	for k, v := range payload {
-		if task.Payload[k] != v {
-			t.Errorf("NewTask() payload[%s] = %v, want %v", k, task.Payload[k], v)
+		if task.Name != "test-task" {
+			t.Errorf("NewTask() Name = %v, want 'test-task'", task.Name)
 		}
-	}
 
-	if task.ID == "" {
-		t.Error("NewTask() should generate a non-empty ID")
-	}
+		// 先检查 Payload 不为空
+		if len(task.Payload) == 0 {
+			t.Error("NewTask() should have non-empty payload")
+		}
 
-	if task.Retry != 0 {
-		t.Errorf("NewTask() Retry = %v, want 0", task.Retry)
-	}
+		// 验证 payload 通过反序列化
+		var actualPayload map[string]any
+		if err := json.Unmarshal(task.Payload, &actualPayload); err != nil {
+			t.Errorf("Failed to unmarshal task payload: %v", err)
+		} else {
+			for k, v := range payload {
+				actualValue := actualPayload[k]
+				// JSON 反序列化会将数字转换为 float64
+				if expectedInt, ok := v.(int); ok {
+					if actualFloat, ok := actualValue.(float64); ok {
+						if int(actualFloat) != expectedInt {
+							t.Errorf("NewTask() payload[%s] = %v, want %v", k, int(actualFloat), expectedInt)
+						}
+					} else {
+						t.Errorf("NewTask() payload[%s] is not a number: %T", k, actualValue)
+					}
+				} else if actualValue != v {
+					t.Errorf("NewTask() payload[%s] = %v, want %v", k, actualValue, v)
+				}
+			}
+		}
+
+		if task.ID == "" {
+			t.Error("NewTask() should generate a non-empty ID")
+		}
+
+		// ExecuteAt should be close to now
+		if time.Since(task.ExecuteAt) > time.Second {
+			t.Errorf("NewTask() ExecuteAt = %v, should be close to now", task.ExecuteAt)
+		}
+	})
+
+	t.Run("task with delay", func(t *testing.T) {
+		delay := 30 * time.Minute
+		now := time.Now()
+		task := NewTask("delayed-task", payload, task.WithDelay(delay))
+
+		expectedTime := now.Add(delay)
+		if task.ExecuteAt.Sub(expectedTime) > time.Second || expectedTime.Sub(task.ExecuteAt) > time.Second {
+			t.Errorf("NewTask() ExecuteAt = %v, want around %v", task.ExecuteAt, expectedTime)
+		}
+	})
 }
 
 func TestNewClient(t *testing.T) {
@@ -170,7 +205,8 @@ func TestWorkerRegister(t *testing.T) {
 	broker := testutil.NewMockBroker()
 	worker := NewWorker(broker, "test-queue", 1)
 
-	handler := func(ctx context.Context, payload map[string]any) (any, error) {
+	// 创建新的 Handler
+	handler := func(ctx *taskcontext.Context) (any, error) {
 		return "result", nil
 	}
 
@@ -240,12 +276,17 @@ func TestTaskTypeAlias(t *testing.T) {
 
 func TestTaskHandlerTypeAlias(t *testing.T) {
 	// Test that TaskHandler is properly aliased
-	var handler TaskHandler = func(ctx context.Context, payload map[string]any) (any, error) {
+	var handler TaskHandler = func(ctx *taskcontext.Context) (any, error) {
 		return "result", nil
 	}
 
-	ctx := context.Background()
-	result, err := handler(ctx, map[string]any{})
+	taskCtx := taskcontext.New(context.Background(), []byte("{}"), &taskcontext.TaskInfo{
+		ID:    "test-id",
+		Name:  "test-task",
+		Retry: 0,
+	})
+
+	result, err := handler(taskCtx)
 	if err != nil {
 		t.Errorf("TaskHandler execution error = %v", err)
 	}

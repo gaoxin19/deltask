@@ -5,20 +5,30 @@ import (
 	"errors"
 
 	"github.com/gaoxin19/deltask/broker"
+	deltacontext "github.com/gaoxin19/deltask/context"
 	"github.com/gaoxin19/deltask/internal"
 	"github.com/gaoxin19/deltask/logger"
 	"github.com/gaoxin19/deltask/task"
 )
 
+// Context 是任务处理函数的上下文，它是 deltacontext.Context 的别名。
+type Context = deltacontext.Context
+
 // Task 是任务的定义，它是 task.Task 的别名，方便用户使用。
 type Task = task.Task
 
-// NewTask 创建一个新任务，是对 task.New 的封装。
-func NewTask(name string, payload map[string]any) *Task {
-	return task.New(name, payload)
+// NewTask 创建一个新任务，使用 options 模式进行配置。
+func NewTask(name string, payload map[string]any, opts ...task.TaskOption) *Task {
+	return task.New(name, payload, opts...)
 }
 
-// TaskHandler 是任务处理函数的类型，它是 task.Handler 的别名。
+// NewTaskWithRawPayload 创建一个具有原始 JSON 字节 payload 的新任务。
+// 这个方法适用于已经有 JSON 数据的场景，避免额外的序列化开销。
+func NewTaskWithRawPayload(name string, payloadBytes []byte, opts ...task.TaskOption) *Task {
+	return task.NewWithRawPayload(name, payloadBytes, opts...)
+}
+
+// TaskHandler 是任务处理函数类型，它是 task.Handler 的别名。
 type TaskHandler = task.Handler
 
 // Client 是用于发布任务到 Broker 的客户端。

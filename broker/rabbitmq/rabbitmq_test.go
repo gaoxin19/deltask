@@ -135,7 +135,7 @@ func TestTaskSerialization(t *testing.T) {
 	originalTask := &task.Task{
 		ID:        "test-id-123",
 		Name:      "test-task",
-		Payload:   map[string]any{"key": "value", "number": 42},
+		Payload:   []byte(`{"key":"value","number":42}`),
 		Retry:     2,
 		ExecuteAt: time.Now().Round(time.Second), // Round to avoid precision issues
 	}
@@ -164,21 +164,40 @@ func TestTaskSerialization(t *testing.T) {
 		t.Errorf("Deserialized Retry = %v, want %v", deserializedTask.Retry, originalTask.Retry)
 	}
 
-	// Check payload
+	// Check payload (both should be JSON bytes)
 	if len(deserializedTask.Payload) != len(originalTask.Payload) {
 		t.Errorf("Deserialized payload length = %v, want %v",
 			len(deserializedTask.Payload), len(originalTask.Payload))
 	}
 
-	for k, v := range originalTask.Payload {
-		deserializedValue := deserializedTask.Payload[k]
+	// 反序列化 payload 来验证内容
+	var originalPayload, deserializedPayload map[string]any
+
+	if err := json.Unmarshal(originalTask.Payload, &originalPayload); err != nil {
+		t.Errorf("Failed to unmarshal original payload: %v", err)
+	}
+
+	if err := json.Unmarshal(deserializedTask.Payload, &deserializedPayload); err != nil {
+		t.Errorf("Failed to unmarshal deserialized payload: %v", err)
+	}
+
+	for k, v := range originalPayload {
+		deserializedValue, exists := deserializedPayload[k]
+		if !exists {
+			t.Errorf("Deserialized payload missing key: %s", k)
+			continue
+		}
 
 		// JSON unmarshaling converts numbers to float64
 		if k == "number" {
 			if floatVal, ok := deserializedValue.(float64); ok {
-				if int(floatVal) != v.(int) {
-					t.Errorf("Deserialized payload[%s] = %v, want %v",
-						k, int(floatVal), v)
+				if originalFloat, ok := v.(float64); ok {
+					if floatVal != originalFloat {
+						t.Errorf("Deserialized payload[%s] = %v, want %v",
+							k, floatVal, originalFloat)
+					}
+				} else {
+					t.Errorf("Original payload[%s] is not float64: %T", k, v)
 				}
 			} else {
 				t.Errorf("Deserialized payload[%s] is not float64: %T", k, deserializedValue)
@@ -417,7 +436,7 @@ func TestMessageBodySerialization(t *testing.T) {
 	testTask := &task.Task{
 		ID:        "test-123",
 		Name:      "serialize-test",
-		Payload:   map[string]any{"data": "value", "count": 42},
+		Payload:   []byte(`{"data":"value","count":42}`),
 		Retry:     1,
 		ExecuteAt: time.Now(),
 	}

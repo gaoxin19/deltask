@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gaoxin19/deltask/broker"
+	deltacontext "github.com/gaoxin19/deltask/context"
 	"github.com/gaoxin19/deltask/logger"
 	"github.com/gaoxin19/deltask/task"
 	"go.uber.org/zap"
@@ -73,6 +74,7 @@ func (w *Worker) QueueName() string {
 	return w.queueName
 }
 
+// Register 注册任务处理器
 func (w *Worker) Register(taskName string, handler task.Handler) {
 	w.registry[taskName] = handler
 }
@@ -141,7 +143,15 @@ func (w *Worker) processTask(ctx context.Context, t *task.Task) {
 
 	w.logTaskStart(t)
 
-	_, err := handler(ctx, t.Payload)
+	// 创建增强的 Context
+	taskInfo := &deltacontext.TaskInfo{
+		ID:    t.ID,
+		Name:  t.Name,
+		Retry: t.Retry,
+	}
+	deltaCtx := deltacontext.New(ctx, t.Payload, taskInfo)
+
+	_, err := handler(deltaCtx)
 	if err != nil {
 		w.logTaskFailure(t, err)
 		w.handleTaskFailure(ctx, t, err)

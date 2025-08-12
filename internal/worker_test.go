@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	deltacontext "github.com/gaoxin19/deltask/context"
 	"github.com/gaoxin19/deltask/logger"
 	"github.com/gaoxin19/deltask/task"
 	"github.com/gaoxin19/deltask/testutil"
@@ -107,7 +108,7 @@ func TestWorkerRegister(t *testing.T) {
 	broker := testutil.NewMockBroker()
 	worker := NewWorker(broker, "test-queue", 1)
 
-	handler := func(ctx context.Context, payload map[string]any) (any, error) {
+	handler := func(ctx *deltacontext.Context) (any, error) {
 		return "result", nil
 	}
 
@@ -123,8 +124,12 @@ func TestWorkerRegister(t *testing.T) {
 	}
 
 	// Test the registered handler
-	ctx := context.Background()
-	result, err := registeredHandler(ctx, map[string]any{})
+	taskCtx := deltacontext.New(context.Background(), []byte("{}"), &deltacontext.TaskInfo{
+		ID:    "test-id",
+		Name:  "test-task",
+		Retry: 0,
+	})
+	result, err := registeredHandler(taskCtx)
 	if err != nil {
 		t.Errorf("Registered handler error = %v", err)
 	}
@@ -230,7 +235,7 @@ func TestCreateRetryTask(t *testing.T) {
 	originalTask := &task.Task{
 		ID:      "test-id",
 		Name:    "test-task",
-		Payload: map[string]any{"key": "value"},
+		Payload: []byte(`{"key":"value"}`),
 		Retry:   2,
 	}
 
@@ -372,7 +377,7 @@ func TestProcessTaskWithSuccess(t *testing.T) {
 	worker := NewWorkerWithLogger(broker, "test-queue", 1, logger.NewNopLogger())
 
 	// Register a successful handler
-	worker.Register("test-task", func(ctx context.Context, payload map[string]any) (any, error) {
+	worker.Register("test-task", func(ctx *deltacontext.Context) (any, error) {
 		return "success", nil
 	})
 
@@ -395,7 +400,7 @@ func TestProcessTaskWithFailure(t *testing.T) {
 	worker := NewWorkerWithLogger(broker, "test-queue", 1, logger.NewNopLogger())
 
 	// Register a failing handler
-	worker.Register("test-task", func(ctx context.Context, payload map[string]any) (any, error) {
+	worker.Register("test-task", func(ctx *deltacontext.Context) (any, error) {
 		return nil, errors.New("task failed")
 	})
 
@@ -454,7 +459,7 @@ func TestWorkerRun(t *testing.T) {
 
 	// Register a handler
 	handlerCalled := false
-	worker.Register("test-task", func(ctx context.Context, payload map[string]any) (any, error) {
+	worker.Register("test-task", func(ctx *deltacontext.Context) (any, error) {
 		handlerCalled = true
 		return "success", nil
 	})
@@ -531,7 +536,7 @@ func TestWorkerWithMultipleConcurrency(t *testing.T) {
 	// Register a handler
 	handlerCallCount := 0
 	var mu sync.Mutex
-	worker.Register("test-task", func(ctx context.Context, payload map[string]any) (any, error) {
+	worker.Register("test-task", func(ctx *deltacontext.Context) (any, error) {
 		mu.Lock()
 		handlerCallCount++
 		mu.Unlock()
