@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
 
@@ -135,6 +136,20 @@ func (w *Worker) Stop() {
 }
 
 func (w *Worker) processTask(ctx context.Context, t *task.Task) {
+	// 添加panic恢复机制
+	defer func() {
+		if r := recover(); r != nil {
+			w.logger.Error("Task handler panicked",
+				zap.String("task_name", t.Name),
+				zap.String("task_id", t.ID),
+				zap.Any("panic_value", r),
+				zap.String("stack_trace", getStackTrace()))
+
+			// 将panic视为任务执行失败，走正常的失败处理流程
+			w.handleTaskFailure(ctx, t, fmt.Errorf("task handler panicked: %v", r))
+		}
+	}()
+
 	handler, ok := w.registry[t.Name]
 	if !ok {
 		w.handleUnknownTask(ctx, t)
@@ -307,4 +322,31 @@ func (w *Worker) calculateRetryDelay(retryCount int) time.Duration {
 	}
 
 	return delay
+}
+
+// getStackTrace 获取当前goroutine的堆栈信息
+func getStackTrace() string {
+	const maxStackFrames = 32
+	var stack [maxStackFrames]uintptr
+
+	// 获取调用栈
+	n := runtime.Callers(3, stack[:]) // 跳过前3层调用（runtime.Callers, getStackTrace, defer函数）
+
+	if n == 0 {
+		return "no stack trace available"
+	}
+
+	// 构建堆栈字符串
+	var result string
+	frames := runtime.CallersFrames(stack[:n])
+
+	for {
+		frame, more := frames.Next()
+		result += fmt.Sprintf("\n\t%s:%d", frame.Function, frame.Line)
+		if !more {
+			break
+		}
+	}
+
+	return result
 }

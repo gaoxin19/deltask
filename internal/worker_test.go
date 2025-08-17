@@ -609,3 +609,88 @@ func TestLogMethods(t *testing.T) {
 	worker.logTaskFailure(testTask, errors.New("test error"))
 	worker.logRetryAttempt(testTask, 5*time.Second, 2)
 }
+
+func TestProcessTaskWithPanic(t *testing.T) {
+	broker := testutil.NewMockBroker()
+	worker := NewWorkerWithLogger(broker, "test-queue", 1, logger.NewNopLogger())
+
+	// 注册一个会panic的handler
+	worker.Register("panic-task", func(ctx *deltacontext.Context) (any, error) {
+		panic("intentional panic for testing")
+	})
+
+	testTask := &task.Task{
+		ID:    "test-id",
+		Name:  "panic-task",
+		Retry: 0,
+	}
+	ctx := context.Background()
+
+	// 这不应该panic，应该被recover捕获
+	worker.processTask(ctx, testTask)
+
+	// 应该发布重试任务，因为panic被视为任务失败
+	if len(broker.PublishCalls) != 1 {
+		t.Errorf("processTask() with panic, publish calls = %v, want 1", len(broker.PublishCalls))
+	}
+
+	// 应该ack原任务（因为重试任务已发布）
+	if len(broker.AckCalls) != 1 {
+		t.Errorf("processTask() with panic, ack calls = %v, want 1", len(broker.AckCalls))
+	}
+}
+
+func TestProcessTaskWithNilPointerPanic(t *testing.T) {
+	broker := testutil.NewMockBroker()
+	worker := NewWorkerWithLogger(broker, "test-queue", 1, logger.NewNopLogger())
+
+	// 注册一个会导致nil pointer dereference的handler
+	worker.Register("nil-pointer-task", func(ctx *deltacontext.Context) (any, error) {
+		var ptr *int
+		*ptr = 42 // 这会导致panic
+		return nil, nil
+	})
+
+	testTask := &task.Task{
+		ID:    "test-id",
+		Name:  "nil-pointer-task",
+		Retry: 0,
+	}
+	ctx := context.Background()
+
+	// 这不应该panic，应该被recover捕获
+	worker.processTask(ctx, testTask)
+
+	// 应该发布重试任务
+	if len(broker.PublishCalls) != 1 {
+		t.Errorf("processTask() with nil pointer panic, publish calls = %v, want 1", len(broker.PublishCalls))
+	}
+}
+
+func TestProcessTaskWithPanicExceedsMaxRetries(t *testing.T) {
+	broker := testutil.NewMockBroker()
+	worker := NewWorkerWithLogger(broker, "test-queue", 1, logger.NewNopLogger())
+
+	// 注册一个会panic的handler
+	worker.Register("panic-task", func(ctx *deltacontext.Context) (any, error) {
+		panic("intentional panic for testing")
+	})
+
+	testTask := &task.Task{
+		ID:    "test-id",
+		Name:  "panic-task",
+		Retry: 3, // 已经达到最大重试次数
+	}
+	ctx := context.Background()
+
+	// 这不应该panic，应该被recover捕获
+	worker.processTask(ctx, testTask)
+
+	// 应该nack任务（不重新入队），因为超过最大重试次数
+	if len(broker.NackCalls) != 1 {
+		t.Errorf("processTask() with panic exceeding max retries, nack calls = %v, want 1", len(broker.NackCalls))
+	}
+	if broker.NackCalls[0].Requeue != false {
+		t.Error("processTask() with panic exceeding max retries should nack with requeue=false")
+	}
+}
