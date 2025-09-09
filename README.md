@@ -17,6 +17,7 @@
 - 🌐 **跨语言支持** - 只需发送标准 JSON 任务格式，即可实现跨语言、跨项目的任务分发
 - ⏰ **延迟任务支持** - 内置延迟任务功能，精确控制任务执行时间
 - 🔄 **重试机制** - 可配置的重试策略，支持指数退避算法
+- 🎨 **类型安全参数绑定** - 类似 web 框架的 `ctx.Bind` 功能，支持结构体绑定和类型安全的数据访问
 
 
 ## 🏗️ 架构设计
@@ -126,16 +127,24 @@ import (
     "github.com/gaoxin19/deltask/broker/rabbitmq"
 )
 
-// 邮件发送处理函数
-func handleSendEmail(ctx context.Context, payload map[string]any) (any, error) {
-    to := payload["to"].(string)
-    subject := payload["subject"].(string)
-    body := payload["body"].(string)
+// 邮件发送请求结构体
+type EmailRequest struct {
+    To      string `json:"to"`
+    Subject string `json:"subject"`
+    Body    string `json:"body"`
+}
+
+// 邮件发送处理函数 - 使用 ctx.Bind 进行类型安全的参数解析
+func handleSendEmail(ctx *deltask.Context) (any, error) {
+    var req EmailRequest
+    if err := ctx.Bind(&req); err != nil {
+        return nil, fmt.Errorf("failed to bind email request: %w", err)
+    }
     
     // 模拟发送邮件
-    fmt.Printf("Sending email to: %s\n", to)
-    fmt.Printf("Subject: %s\n", subject)
-    fmt.Printf("Body: %s\n", body)
+    fmt.Printf("Sending email to: %s\n", req.To)
+    fmt.Printf("Subject: %s\n", req.Subject)
+    fmt.Printf("Body: %s\n", req.Body)
     
     return map[string]any{
         "status":     "sent",
@@ -182,6 +191,75 @@ go run publisher/main.go
 
 ## 📚 高级用法
 
+### 参数绑定 (ctx.Bind)
+
+Deltask 提供了类似 web 框架的 `ctx.Bind` 功能，支持将任务 payload 直接绑定到结构体，实现类型安全的参数解析：
+
+```go
+// 定义请求结构体
+type UserRegistrationRequest struct {
+    Username string `json:"username"`
+    Email    string `json:"email"`
+    Age      int    `json:"age"`
+}
+
+// 使用 ctx.Bind 进行参数绑定
+func handleUserRegistration(ctx *deltask.Context) (any, error) {
+    var req UserRegistrationRequest
+    if err := ctx.Bind(&req); err != nil {
+        return nil, fmt.Errorf("invalid request: %w", err)
+    }
+    
+    // 现在可以直接使用结构体字段，享受类型安全
+    fmt.Printf("Registering user: %s (%s), age: %d\n", 
+        req.Username, req.Email, req.Age)
+    
+    return map[string]any{
+        "user_id": "user_123",
+        "status":  "registered",
+    }, nil
+}
+
+// 注册处理函数
+worker.Register("user_registration", handleUserRegistration)
+```
+
+#### 支持的绑定方式
+
+1. **结构体绑定** - 最常用的方式，支持 JSON 标签
+2. **基础类型访问** - 通过 `ctx.Get*` 方法获取特定类型的值
+3. **原始数据访问** - 通过 `ctx.Payload()` 获取原始 map 数据
+
+```go
+func handleFlexibleTask(ctx *deltask.Context) (any, error) {
+    // 方式1: 结构体绑定（推荐）
+    var req struct {
+        Name string `json:"name"`
+        ID   int    `json:"id"`
+    }
+    if err := ctx.Bind(&req); err != nil {
+        return nil, err
+    }
+    
+    // 方式2: 类型安全的基础类型访问
+    if name, ok := ctx.GetString("name"); ok {
+        fmt.Printf("Name: %s\n", name)
+    }
+    
+    if id, ok := ctx.GetInt("id"); ok {
+        fmt.Printf("ID: %d\n", id)
+    }
+    
+    // 方式3: 原始数据访问（向后兼容）
+    payload := ctx.Payload()
+    if value, exists := payload["custom_field"]; exists {
+        fmt.Printf("Custom field: %v\n", value)
+    }
+    
+    return "success", nil
+}
+```
+
 ### 延迟任务
 
 ```go
@@ -197,6 +275,51 @@ client.Publish(ctx, task, "maintenance_queue")
 ### 多队列 Worker
 
 ```go
+// 定义不同类型的请求结构体
+type ImageProcessRequest struct {
+    ImageURL string `json:"image_url"`
+    Width    int    `json:"width"`
+    Height   int    `json:"height"`
+    Format   string `json:"format"`
+}
+
+type CleanupRequest struct {
+    Directory string `json:"directory"`
+    MaxAge    int    `json:"max_age_hours"`
+}
+
+// 图像处理处理函数
+func handleProcessImage(ctx *deltask.Context) (any, error) {
+    var req ImageProcessRequest
+    if err := ctx.Bind(&req); err != nil {
+        return nil, fmt.Errorf("invalid image request: %w", err)
+    }
+    
+    log.Printf("Processing image: %s (%dx%d) to %s", 
+        req.ImageURL, req.Width, req.Height, req.Format)
+    
+    return map[string]any{
+        "processed_url": "https://example.com/processed.jpg",
+        "size":          "2.5MB",
+    }, nil
+}
+
+// 清理任务处理函数
+func handleCleanupTempFiles(ctx *deltask.Context) (any, error) {
+    var req CleanupRequest
+    if err := ctx.Bind(&req); err != nil {
+        return nil, fmt.Errorf("invalid cleanup request: %w", err)
+    }
+    
+    log.Printf("Cleaning up directory: %s (max age: %d hours)", 
+        req.Directory, req.MaxAge)
+    
+    return map[string]any{
+        "files_deleted": 42,
+        "space_freed":    "1.2GB",
+    }, nil
+}
+
 // 创建处理不同类型任务的多个 Worker
 workers := map[string]*deltask.Worker{
     "email":       deltask.NewWorker(broker, "email_queue", 2),
@@ -217,6 +340,73 @@ for name, worker := range workers {
             log.Printf("Worker %s failed: %v", n, err)
         }
     }(name, worker)
+}
+```
+
+### Context 使用示例
+
+Deltask 提供了强大的 Context 功能，支持多种数据访问方式：
+
+```go
+// 定义请求结构体
+type UserData struct {
+    ID       int    `json:"id"`
+    Name     string `json:"name"`
+    Email    string `json:"email"`
+    Age      int    `json:"age"`
+    IsActive bool   `json:"is_active"`
+}
+
+// 使用 ctx.Bind 进行结构体绑定（推荐方式）
+func processUserHandler(ctx *deltask.Context) (any, error) {
+    var userData UserData
+    if err := ctx.Bind(&userData); err != nil {
+        return nil, fmt.Errorf("failed to bind user data: %w", err)
+    }
+    
+    log.Printf("Processing user: ID=%d, Name=%s, Email=%s, Age=%d, Active=%t",
+        userData.ID, userData.Name, userData.Email, userData.Age, userData.IsActive)
+    
+    // 获取任务信息
+    taskInfo := ctx.Task()
+    log.Printf("Task info: ID=%s, Name=%s, Retry=%d", 
+        taskInfo.ID, taskInfo.Name, taskInfo.Retry)
+    
+    return map[string]any{
+        "processed_user_id": userData.ID,
+        "status":            "success",
+    }, nil
+}
+
+// 混合数据访问方式
+func flexibleHandler(ctx *deltask.Context) (any, error) {
+    // 方式1: 结构体绑定
+    type PartialData struct {
+        Name string `json:"name"`
+        Type string `json:"type"`
+    }
+    
+    var partial PartialData
+    if err := ctx.Bind(&partial); err != nil {
+        return nil, err
+    }
+    
+    // 方式2: 类型安全的基础类型访问
+    count, _ := ctx.GetInt("count")
+    score, _ := ctx.GetFloat64("score")
+    enabled, _ := ctx.GetBool("enabled")
+    
+    // 方式3: 原始数据访问（向后兼容）
+    rawPayload := ctx.Payload()
+    if customField, exists := rawPayload["custom_field"]; exists {
+        log.Printf("Custom field: %v", customField)
+    }
+    
+    return map[string]any{
+        "processed_name": partial.Name,
+        "total_count":    count * 2,
+        "final_score":    score + 10,
+    }, nil
 }
 ```
 
