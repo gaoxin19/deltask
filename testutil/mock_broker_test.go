@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/gaoxin19/deltask/task"
 )
@@ -102,5 +103,69 @@ func TestMockBrokerReset(t *testing.T) {
 	}
 	if broker.CloseCalls != 0 {
 		t.Error("Close calls should be reset")
+	}
+}
+
+func TestMockBrokerDisconnectReconnect(t *testing.T) {
+	broker := NewMockBroker()
+	ctx := context.Background()
+
+	// 测试正常连接
+	ch, err := broker.Consume(ctx, "test-queue")
+	if err != nil {
+		t.Fatalf("Consume() error = %v", err)
+	}
+
+	// 发送任务
+	task1 := task.New("test", nil)
+	if !broker.SendTaskToLatest(task1) {
+		t.Error("Failed to send task")
+	}
+
+	// 接收任务
+	select {
+	case receivedTask := <-ch:
+		if receivedTask == nil {
+			t.Error("Received nil task")
+		}
+	case <-time.After(time.Second):
+		t.Error("Failed to receive task")
+	}
+
+	// 断开连接
+	broker.Disconnect()
+
+	// 验证 Ack 失败
+	err = broker.Ack(ctx, task1)
+	if err == nil {
+		t.Error("Expected error on Ack after disconnect")
+	}
+	if err.Error() != "channel/connection is not open" {
+		t.Errorf("Expected 'channel/connection is not open' error, got %v", err)
+	}
+
+	// 重新连接
+	broker.Reconnect()
+
+	// 验证可以再次消费
+	ch2, err := broker.Consume(ctx, "test-queue")
+	if err != nil {
+		t.Fatalf("Consume() after reconnect error = %v", err)
+	}
+
+	// 发送新任务
+	task2 := task.New("test2", nil)
+	if !broker.SendTaskToLatest(task2) {
+		t.Error("Failed to send task after reconnect")
+	}
+
+	// 接收新任务
+	select {
+	case receivedTask := <-ch2:
+		if receivedTask == nil {
+			t.Error("Received nil task after reconnect")
+		}
+	case <-time.After(time.Second):
+		t.Error("Failed to receive task after reconnect")
 	}
 }

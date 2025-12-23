@@ -43,6 +43,7 @@ type rabbitBroker struct {
 
 	delayedExchangeName string
 	isClosed            bool
+	reconnectStarted    bool // 标记是否已启动重连监听
 }
 
 // NewBroker 创建一个新的 RabbitMQ Broker 实例
@@ -111,8 +112,11 @@ func (b *rabbitBroker) connect() error {
 		return fmt.Errorf("failed to declare delayed exchange: %w", err)
 	}
 
-	// 监听连接关闭事件，用于自动重连
-	go b.handleReconnect()
+	// 监听连接关闭事件，用于自动重连（只启动一次）
+	if !b.reconnectStarted {
+		b.reconnectStarted = true
+		go b.handleReconnect()
+	}
 
 	b.logger.Info("RabbitMQ broker connected",
 		zap.String("namespace", b.config.Namespace),
@@ -122,30 +126,62 @@ func (b *rabbitBroker) connect() error {
 
 // handleReconnect 监听连接关闭信号并尝试重连
 func (b *rabbitBroker) handleReconnect() {
-	closeChan := b.conn.NotifyClose(make(chan *amqp.Error))
-
-	err := <-closeChan
-	if err != nil {
-		b.logger.Warn("RabbitMQ connection closed, attempting to reconnect", zap.Error(err))
-	}
-
-	b.mu.Lock()
-	if b.isClosed { // 如果是主动关闭，则不重连
-		b.mu.Unlock()
-		return
-	}
-	b.mu.Unlock()
-
-	// 使用指数退避策略进行重连
 	for {
-		// 简单的固定延迟，生产环境可换成指数退避
-		time.Sleep(5 * time.Second)
-		b.logger.Info("Attempting to reconnect to RabbitMQ")
-		if err := b.connect(); err == nil {
-			b.logger.Info("RabbitMQ reconnected successfully")
+		b.mu.Lock()
+		conn := b.conn
+		isClosed := b.isClosed
+		b.mu.Unlock()
+
+		if isClosed {
 			return
 		}
-		b.logger.Error("RabbitMQ reconnection failed", zap.Error(err))
+
+		if conn == nil {
+			// 连接尚未建立，等待一段时间后重试
+			time.Sleep(time.Second)
+			continue
+		}
+
+		closeChan := conn.NotifyClose(make(chan *amqp.Error))
+
+		err := <-closeChan
+		if err != nil {
+			b.logger.Warn("RabbitMQ connection closed, attempting to reconnect", zap.Error(err))
+		}
+
+		b.mu.Lock()
+		if b.isClosed { // 如果是主动关闭，则不重连
+			b.mu.Unlock()
+			return
+		}
+		// 清理旧的连接和通道引用
+		b.channel = nil
+		b.conn = nil
+		b.mu.Unlock()
+
+		// 使用指数退避策略进行重连
+		const maxReconnectDelay = 30 * time.Second
+		reconnectDelay := time.Second
+
+		for {
+			// 等待后重试
+			time.Sleep(reconnectDelay)
+			b.logger.Info("Attempting to reconnect to RabbitMQ",
+				zap.Duration("retry_delay", reconnectDelay))
+
+			if err := b.connect(); err == nil {
+				b.logger.Info("RabbitMQ reconnected successfully")
+				// 重连成功，继续监听新的连接
+				break
+			}
+			b.logger.Error("RabbitMQ reconnection failed", zap.Error(err))
+
+			// 指数退避
+			reconnectDelay *= 2
+			if reconnectDelay > maxReconnectDelay {
+				reconnectDelay = maxReconnectDelay
+			}
+		}
 	}
 }
 
@@ -156,7 +192,11 @@ func (b *rabbitBroker) prefixed(name string) string {
 
 // Publish 实现了 Broker 接口的 Publish 方法
 func (b *rabbitBroker) Publish(ctx context.Context, t *task.Task, queueName string) error {
-	if b.channel == nil {
+	b.mu.Lock()
+	channel := b.channel
+	b.mu.Unlock()
+
+	if channel == nil {
 		return errors.New("broker is not connected")
 	}
 
@@ -173,7 +213,7 @@ func (b *rabbitBroker) Publish(ctx context.Context, t *task.Task, queueName stri
 
 	routingKey := b.prefixed(queueName)
 
-	return b.channel.PublishWithContext(ctx,
+	err = channel.PublishWithContext(ctx,
 		b.delayedExchangeName, // exchange
 		routingKey,            // routing key
 		false,                 // mandatory
@@ -184,11 +224,28 @@ func (b *rabbitBroker) Publish(ctx context.Context, t *task.Task, queueName stri
 			Body:         body,
 			Headers:      headers,
 		})
+
+	// 如果发布失败且是连接错误，检查连接状态
+	if err != nil {
+		b.mu.Lock()
+		if b.channel == nil || b.conn == nil || b.conn.IsClosed() {
+			b.mu.Unlock()
+			return fmt.Errorf("broker connection lost: %w", err)
+		}
+		b.mu.Unlock()
+	}
+
+	return err
 }
 
 // Consume 实现了 Broker 接口的 Consume 方法
 func (b *rabbitBroker) Consume(ctx context.Context, queueName string, opts ...broker.ConsumeOption) (<-chan *task.Task, error) {
-	if b.channel == nil {
+	b.mu.Lock()
+	channel := b.channel
+	conn := b.conn
+	b.mu.Unlock()
+
+	if channel == nil || conn == nil || conn.IsClosed() {
 		return nil, errors.New("broker is not connected")
 	}
 
@@ -202,23 +259,23 @@ func (b *rabbitBroker) Consume(ctx context.Context, queueName string, opts ...br
 	prefixedQueueName := b.prefixed(queueName)
 
 	// 声明队列 (幂等)
-	_, err := b.channel.QueueDeclare(prefixedQueueName, true, false, false, false, nil)
+	_, err := channel.QueueDeclare(prefixedQueueName, true, false, false, false, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to declare queue '%s': %w", prefixedQueueName, err)
 	}
 
 	// 将队列绑定到延迟交换机 (幂等)
-	err = b.channel.QueueBind(prefixedQueueName, prefixedQueueName, b.delayedExchangeName, false, nil)
+	err = channel.QueueBind(prefixedQueueName, prefixedQueueName, b.delayedExchangeName, false, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to bind queue '%s': %w", prefixedQueueName, err)
 	}
 
 	// 设置 QoS 预取数量（prefetch）
-	if err := b.channel.Qos(consumeOptions.PrefetchCount, 0, false); err != nil {
+	if err := channel.Qos(consumeOptions.PrefetchCount, 0, false); err != nil {
 		return nil, fmt.Errorf("failed to set QoS (prefetch=%d): %w", consumeOptions.PrefetchCount, err)
 	}
 
-	deliveries, err := b.channel.Consume(prefixedQueueName, "", false, false, false, false, nil)
+	deliveries, err := channel.Consume(prefixedQueueName, "", false, false, false, false, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start consuming from queue '%s': %w", prefixedQueueName, err)
 	}
@@ -259,6 +316,16 @@ func (b *rabbitBroker) Ack(ctx context.Context, t *task.Task) error {
 	if !ok {
 		return errors.New("invalid broker metadata for ack: not an amqp.Delivery")
 	}
+
+	// 检查连接状态
+	b.mu.Lock()
+	connClosed := b.conn == nil || b.conn.IsClosed()
+	b.mu.Unlock()
+
+	if connClosed {
+		return errors.New("channel/connection is not open")
+	}
+
 	return delivery.Ack(false) // false for single message ack
 }
 
@@ -268,6 +335,16 @@ func (b *rabbitBroker) Nack(ctx context.Context, t *task.Task, requeue bool) err
 	if !ok {
 		return errors.New("invalid broker metadata for nack: not an amqp.Delivery")
 	}
+
+	// 检查连接状态
+	b.mu.Lock()
+	connClosed := b.conn == nil || b.conn.IsClosed()
+	b.mu.Unlock()
+
+	if connClosed {
+		return errors.New("channel/connection is not open")
+	}
+
 	return delivery.Nack(false, requeue)
 }
 
