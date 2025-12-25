@@ -3,6 +3,7 @@ package rabbitmq
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -308,9 +309,9 @@ func TestRabbitBrokerPublishValidation(t *testing.T) {
 	if err == nil {
 		t.Error("Publish() with nil channel should return error")
 	}
-	expectedError := "broker is not connected"
-	if err.Error() != expectedError {
-		t.Errorf("Publish() error = %v, want %v", err.Error(), expectedError)
+	// 应该返回 ErrBrokerNotConnected 错误
+	if !errors.Is(err, ErrBrokerNotConnected) {
+		t.Errorf("Publish() error = %v, want ErrBrokerNotConnected", err.Error())
 	}
 }
 
@@ -331,9 +332,9 @@ func TestRabbitBrokerConsumeValidation(t *testing.T) {
 	if ch != nil {
 		t.Error("Consume() with error should return nil channel")
 	}
-	expectedError := "broker is not connected"
-	if err.Error() != expectedError {
-		t.Errorf("Consume() error = %v, want %v", err.Error(), expectedError)
+	// 应该返回 ErrBrokerReconnecting 错误
+	if !errors.Is(err, ErrBrokerReconnecting) {
+		t.Errorf("Consume() error = %v, want ErrBrokerReconnecting", err.Error())
 	}
 }
 

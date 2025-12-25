@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"runtime"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gaoxin19/deltask/broker"
+	"github.com/gaoxin19/deltask/broker/rabbitmq"
 	deltacontext "github.com/gaoxin19/deltask/context"
 	"github.com/gaoxin19/deltask/logger"
 	"github.com/gaoxin19/deltask/task"
@@ -113,6 +115,7 @@ func (w *Worker) Run(ctx context.Context) error {
 func (w *Worker) runWorkerLoop(ctx context.Context, workerID int, brokerConsumeOptions []broker.ConsumeOption) {
 	const maxReconnectDelay = 30 * time.Second
 	const baseReconnectDelay = time.Second
+	const reconnectingDelay = 5 * time.Second // 检测到重连时的等待时间
 	reconnectDelay := baseReconnectDelay
 
 	// 为每个 worker 创建独立的随机数生成器，避免同步重试
@@ -129,22 +132,34 @@ func (w *Worker) runWorkerLoop(ctx context.Context, workerID int, brokerConsumeO
 		// 尝试开始消费
 		msgChan, err := w.broker.Consume(ctx, w.queueName, brokerConsumeOptions...)
 		if err != nil {
+			// 检测是否是正在重连的错误
+			isReconnecting := errors.Is(err, rabbitmq.ErrBrokerReconnecting)
+
 			w.logger.Error("Failed to start consuming, will retry",
 				zap.Int("worker_id", workerID),
 				zap.String("queue", w.queueName),
 				zap.Error(err),
+				zap.Bool("reconnecting", isReconnecting),
 				zap.Duration("retry_delay", reconnectDelay))
 
+			// 如果是等待重连的错误，给 handleReconnect 更多时间
+			waitDelay := reconnectDelay
+			if isReconnecting {
+				waitDelay = reconnectingDelay
+			}
+
 			// 等待后重试（添加随机抖动避免同步重试）
-			actualDelay := w.addJitter(reconnectDelay, rng)
+			actualDelay := w.addJitter(waitDelay, rng)
 			select {
 			case <-ctx.Done():
 				return
 			case <-time.After(actualDelay):
-				// 指数退避，但不超过最大值
-				reconnectDelay *= 2
-				if reconnectDelay > maxReconnectDelay {
-					reconnectDelay = maxReconnectDelay
+				if !isReconnecting {
+					// 指数退避，但不超过最大值
+					reconnectDelay *= 2
+					if reconnectDelay > maxReconnectDelay {
+						reconnectDelay = maxReconnectDelay
+					}
 				}
 				continue
 			}

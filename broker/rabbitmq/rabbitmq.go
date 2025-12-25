@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +22,28 @@ import (
 const (
 	delayedExchangeType = "x-delayed-message"
 )
+
+// ErrBrokerNotConnected 表示 broker 未连接（正在重连中）
+var ErrBrokerNotConnected = errors.New("broker is not connected")
+
+// ErrBrokerReconnecting 表示 broker 正在重连中
+var ErrBrokerReconnecting = errors.New("broker is reconnecting")
+
+// ErrBrokerClosed 表示 broker 已关闭
+var ErrBrokerClosed = errors.New("broker is closed")
+
+// isChannelError 判断错误是否是通道/连接相关的错误
+func isChannelError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "channel/connection is not open") ||
+		strings.Contains(errStr, "channel error") ||
+		strings.Contains(errStr, "connection closed") ||
+		strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "socket closed")
+}
 
 // Config 封装了连接 RabbitMQ 所需的配置
 type Config struct {
@@ -113,9 +136,13 @@ func (b *rabbitBroker) connect() error {
 	}
 
 	// 监听连接关闭事件，用于自动重连（只启动一次）
+	b.mu.Lock()
 	if !b.reconnectStarted {
 		b.reconnectStarted = true
+		b.mu.Unlock()
 		go b.handleReconnect()
+	} else {
+		b.mu.Unlock()
 	}
 
 	b.logger.Info("RabbitMQ broker connected",
@@ -145,12 +172,9 @@ func (b *rabbitBroker) handleReconnect() {
 		closeChan := conn.NotifyClose(make(chan *amqp.Error))
 
 		err := <-closeChan
-		if err != nil {
-			b.logger.Warn("RabbitMQ connection closed, attempting to reconnect", zap.Error(err))
-		}
-
+		// 连接关闭，检查是否是主动关闭
 		b.mu.Lock()
-		if b.isClosed { // 如果是主动关闭，则不重连
+		if b.isClosed {
 			b.mu.Unlock()
 			return
 		}
@@ -159,6 +183,10 @@ func (b *rabbitBroker) handleReconnect() {
 		b.conn = nil
 		b.mu.Unlock()
 
+		if err != nil {
+			b.logger.Warn("RabbitMQ connection closed, attempting to reconnect", zap.Error(err))
+		}
+
 		// 使用指数退避策略进行重连
 		const maxReconnectDelay = 30 * time.Second
 		reconnectDelay := time.Second
@@ -166,6 +194,15 @@ func (b *rabbitBroker) handleReconnect() {
 		for {
 			// 等待后重试
 			time.Sleep(reconnectDelay)
+
+			// 检查是否已关闭（Sleep 后检查一次即可）
+			b.mu.Lock()
+			if b.isClosed {
+				b.mu.Unlock()
+				return
+			}
+			b.mu.Unlock()
+
 			b.logger.Info("Attempting to reconnect to RabbitMQ",
 				zap.Duration("retry_delay", reconnectDelay))
 
@@ -192,50 +229,82 @@ func (b *rabbitBroker) prefixed(name string) string {
 
 // Publish 实现了 Broker 接口的 Publish 方法
 func (b *rabbitBroker) Publish(ctx context.Context, t *task.Task, queueName string) error {
-	b.mu.Lock()
-	channel := b.channel
-	b.mu.Unlock()
+	const maxPublishRetries = 5
+	retryCount := 0
 
-	if channel == nil {
-		return errors.New("broker is not connected")
-	}
-
-	body, err := json.Marshal(t)
-	if err != nil {
-		return fmt.Errorf("failed to marshal task: %w", err)
-	}
-
-	headers := amqp.Table{}
-	// 如果任务的期望执行时间在未来，计算延迟毫秒数
-	if delay := time.Until(t.ExecuteAt).Milliseconds(); delay > 0 {
-		headers["x-delay"] = delay
-	}
-
-	routingKey := b.prefixed(queueName)
-
-	err = channel.PublishWithContext(ctx,
-		b.delayedExchangeName, // exchange
-		routingKey,            // routing key
-		false,                 // mandatory
-		false,                 // immediate
-		amqp.Publishing{
-			ContentType:  "application/json",
-			DeliveryMode: amqp.Persistent, // 保证消息持久化
-			Body:         body,
-			Headers:      headers,
-		})
-
-	// 如果发布失败且是连接错误，检查连接状态
-	if err != nil {
+	for {
 		b.mu.Lock()
-		if b.channel == nil || b.conn == nil || b.conn.IsClosed() {
-			b.mu.Unlock()
-			return fmt.Errorf("broker connection lost: %w", err)
-		}
+		channel := b.channel
+		conn := b.conn
+		isClosed := b.isClosed
 		b.mu.Unlock()
-	}
 
-	return err
+		if isClosed {
+			return errors.New("broker is closed")
+		}
+
+		if channel == nil {
+			// 如果从未建立过连接（conn 也是 nil），立即返回错误
+			if conn == nil {
+				return ErrBrokerNotConnected
+			}
+			// 通道正在重连，等待后重试
+			if retryCount >= maxPublishRetries {
+				return errors.New("broker is reconnecting, max retries exceeded")
+			}
+			retryCount++
+			delay := time.Second << min(retryCount, 3)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+				continue
+			}
+		}
+
+		body, err := json.Marshal(t)
+		if err != nil {
+			return fmt.Errorf("failed to marshal task: %w", err)
+		}
+
+		headers := amqp.Table{}
+		// 如果任务的期望执行时间在未来，计算延迟毫秒数
+		if delay := time.Until(t.ExecuteAt).Milliseconds(); delay > 0 {
+			headers["x-delay"] = delay
+		}
+
+		routingKey := b.prefixed(queueName)
+
+		err = channel.PublishWithContext(ctx,
+			b.delayedExchangeName, // exchange
+			routingKey,            // routing key
+			false,                 // mandatory
+			false,                 // immediate
+			amqp.Publishing{
+				ContentType:  "application/json",
+				DeliveryMode: amqp.Persistent, // 保证消息持久化
+				Body:         body,
+				Headers:      headers,
+			})
+
+		if err != nil {
+			// 发布失败，检查是否是连接问题
+			b.mu.Lock()
+			if b.channel == nil || b.conn == nil || b.conn.IsClosed() {
+				b.mu.Unlock()
+				retryCount++
+				if retryCount >= maxPublishRetries {
+					return errors.New("broker connection lost, max retries exceeded")
+				}
+				// 通道已失效，循环重试
+				continue
+			}
+			b.mu.Unlock()
+			return fmt.Errorf("failed to publish task: %w", err)
+		}
+
+		return nil
+	}
 }
 
 // Consume 实现了 Broker 接口的 Consume 方法
@@ -243,10 +312,15 @@ func (b *rabbitBroker) Consume(ctx context.Context, queueName string, opts ...br
 	b.mu.Lock()
 	channel := b.channel
 	conn := b.conn
+	isClosed := b.isClosed
 	b.mu.Unlock()
 
+	if isClosed {
+		return nil, ErrBrokerClosed
+	}
+
 	if channel == nil || conn == nil || conn.IsClosed() {
-		return nil, errors.New("broker is not connected")
+		return nil, ErrBrokerReconnecting
 	}
 
 	consumeOptions := &broker.ConsumeOptions{
@@ -261,22 +335,35 @@ func (b *rabbitBroker) Consume(ctx context.Context, queueName string, opts ...br
 	// 声明队列 (幂等)
 	_, err := channel.QueueDeclare(prefixedQueueName, true, false, false, false, nil)
 	if err != nil {
+		// 如果是连接/通道错误，返回 broker 未连接
+		if isChannelError(err) {
+			return nil, ErrBrokerNotConnected
+		}
 		return nil, fmt.Errorf("failed to declare queue '%s': %w", prefixedQueueName, err)
 	}
 
 	// 将队列绑定到延迟交换机 (幂等)
 	err = channel.QueueBind(prefixedQueueName, prefixedQueueName, b.delayedExchangeName, false, nil)
 	if err != nil {
+		if isChannelError(err) {
+			return nil, ErrBrokerNotConnected
+		}
 		return nil, fmt.Errorf("failed to bind queue '%s': %w", prefixedQueueName, err)
 	}
 
 	// 设置 QoS 预取数量（prefetch）
 	if err := channel.Qos(consumeOptions.PrefetchCount, 0, false); err != nil {
+		if isChannelError(err) {
+			return nil, ErrBrokerNotConnected
+		}
 		return nil, fmt.Errorf("failed to set QoS (prefetch=%d): %w", consumeOptions.PrefetchCount, err)
 	}
 
 	deliveries, err := channel.Consume(prefixedQueueName, "", false, false, false, false, nil)
 	if err != nil {
+		if isChannelError(err) {
+			return nil, ErrBrokerNotConnected
+		}
 		return nil, fmt.Errorf("failed to start consuming from queue '%s': %w", prefixedQueueName, err)
 	}
 
@@ -284,6 +371,11 @@ func (b *rabbitBroker) Consume(ctx context.Context, queueName string, opts ...br
 
 	go func() {
 		defer close(msgChan)
+		defer func() {
+			if r := recover(); r != nil {
+				b.logger.Error("Consume goroutine panic", zap.Any("panic", r))
+			}
+		}()
 		for {
 			select {
 			case <-ctx.Done():
@@ -297,7 +389,8 @@ func (b *rabbitBroker) Consume(ctx context.Context, queueName string, opts ...br
 				var t task.Task
 				if err := json.Unmarshal(d.Body, &t); err != nil {
 					b.logger.Error("Failed to unmarshal message body (dropping)", zap.Error(err))
-					_ = d.Nack(false, false) // 丢弃格式错误的消息
+					// 使用 requeue=false 丢弃格式错误的消息，忽略 Nack 错误
+					_ = d.Nack(false, false)
 					continue
 				}
 				// 将 amqp.Delivery 存入 BrokerMeta，以便 Ack/Nack 时使用
@@ -317,16 +410,10 @@ func (b *rabbitBroker) Ack(ctx context.Context, t *task.Task) error {
 		return errors.New("invalid broker metadata for ack: not an amqp.Delivery")
 	}
 
-	// 检查连接状态
-	b.mu.Lock()
-	connClosed := b.conn == nil || b.conn.IsClosed()
-	b.mu.Unlock()
-
-	if connClosed {
-		return errors.New("channel/connection is not open")
-	}
-
-	return delivery.Ack(false) // false for single message ack
+	// 忽略连接错误：如果连接已断开，消息会被 RabbitMQ 重新投递
+	// 这样可以避免 Ack/Nack 时的竞态条件
+	_ = delivery.Ack(false)
+	return nil
 }
 
 // Nack 拒绝消息
@@ -336,16 +423,9 @@ func (b *rabbitBroker) Nack(ctx context.Context, t *task.Task, requeue bool) err
 		return errors.New("invalid broker metadata for nack: not an amqp.Delivery")
 	}
 
-	// 检查连接状态
-	b.mu.Lock()
-	connClosed := b.conn == nil || b.conn.IsClosed()
-	b.mu.Unlock()
-
-	if connClosed {
-		return errors.New("channel/connection is not open")
-	}
-
-	return delivery.Nack(false, requeue)
+	// 忽略连接错误：如果连接已断开，消息会被 RabbitMQ 重新投递
+	_ = delivery.Nack(false, requeue)
+	return nil
 }
 
 // Close 关闭连接
