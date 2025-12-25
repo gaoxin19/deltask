@@ -95,7 +95,7 @@ func TestWorkerReconnectAfterChannelClose(t *testing.T) {
 	// 等待 worker 成功重新消费
 	// Worker 会在检测到通道关闭后，等待 reconnectDelay（可能已经增加到 2 秒或更多）后重试
 	// 重连后，Worker 应该能够成功 Consume
-	// 我们需要等待足够长的时间，让 Worker 完成重试并成功建立连接
+	// 需要等待足够长的时间，让 Worker 完成重试并成功建立连接
 
 	// 验证新的消费通道已建立（轮询等待）
 	maxWait := 5 * time.Second
@@ -375,7 +375,7 @@ func TestWorkerExponentialBackoff(t *testing.T) {
 
 		// 第一次重试延迟：通道关闭后初始延迟 0.5s + 随机抖动（±25%）
 		// 所以实际延迟范围：0.375s - 0.625s
-		// 我们检查至少 300ms 以确保有延迟
+		// 检查至少 300ms 以确保有延迟
 		if delay1 < 300*time.Millisecond {
 			t.Errorf("Expected delay between retries (at least 300ms), got %v", delay1)
 		}

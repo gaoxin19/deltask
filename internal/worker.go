@@ -2,15 +2,12 @@ package internal
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"math/rand"
 	"runtime"
 	"sync"
 	"time"
 
 	"github.com/gaoxin19/deltask/broker"
-	"github.com/gaoxin19/deltask/broker/rabbitmq"
 	deltacontext "github.com/gaoxin19/deltask/context"
 	"github.com/gaoxin19/deltask/logger"
 	"github.com/gaoxin19/deltask/task"
@@ -44,7 +41,6 @@ type Worker struct {
 	retryPolicy RetryPolicy
 	logger      *logger.Logger
 	wg          sync.WaitGroup
-	cancel      context.CancelFunc
 }
 
 func NewWorker(b broker.Broker, queueName string, concurrency int) *Worker {
@@ -74,193 +70,87 @@ func (w *Worker) WithRetryPolicy(policy RetryPolicy) *Worker {
 	return w
 }
 
-func (w *Worker) QueueName() string {
-	return w.queueName
-}
-
-// Register 注册任务处理器
 func (w *Worker) Register(taskName string, handler task.Handler) {
 	w.registry[taskName] = handler
 }
 
+// QueueName 返回 Worker 监听的队列名称
+func (w *Worker) QueueName() string {
+	return w.queueName
+}
+
+// Run 启动 Worker，该方法会阻塞直到 ctx 被取消
 func (w *Worker) Run(ctx context.Context) error {
-	// 创建可取消的上下文
-	workerCtx, cancel := context.WithCancel(ctx)
-	w.cancel = cancel
-
-	brokerConsumeOptions := []broker.ConsumeOption{
-		broker.WithPrefetchCount(w.concurrency), // 设置预取数量与并发数一致
-	}
-
-	w.logger.Info("Starting workers for queue",
+	w.logger.Info("Starting workers",
 		zap.Int("concurrency", w.concurrency),
 		zap.String("queue", w.queueName))
 
-	// 启动 worker goroutines
-	for i := range w.concurrency {
+	// 获取消息通道
+	// 注意：Broker 实现必须支持自动重连，返回一个长期有效的 Channel
+	msgChan, err := w.broker.Consume(ctx, w.queueName, broker.WithPrefetchCount(w.concurrency))
+	if err != nil {
+		return fmt.Errorf("failed to start consumer: %w", err)
+	}
+
+	for i := 0; i < w.concurrency; i++ {
 		w.wg.Add(1)
-		go func(workerID int) {
+		go func(id int) {
 			defer w.wg.Done()
-			w.logger.Info("Worker started", zap.Int("worker_id", workerID))
-			w.runWorkerLoop(workerCtx, workerID, brokerConsumeOptions)
+			w.runWorker(ctx, id, msgChan)
 		}(i + 1)
 	}
 
+	// 等待所有 Worker 退出（通常由 ctx.Done 触发）
 	w.wg.Wait()
-	w.logger.Info("All workers have shut down")
+	w.logger.Info("All workers stopped")
 	return nil
 }
 
-// runWorkerLoop 运行单个 worker 的主循环，支持自动重新消费
-func (w *Worker) runWorkerLoop(ctx context.Context, workerID int, brokerConsumeOptions []broker.ConsumeOption) {
-	const maxReconnectDelay = 30 * time.Second
-	const baseReconnectDelay = time.Second
-	const reconnectingDelay = 5 * time.Second // 检测到重连时的等待时间
-	reconnectDelay := baseReconnectDelay
-
-	// 为每个 worker 创建独立的随机数生成器，避免同步重试
-	rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
+// runWorker 极简的 Worker 循环
+func (w *Worker) runWorker(ctx context.Context, id int, msgChan <-chan *task.Task) {
+	w.logger.Info("Worker started", zap.Int("worker_id", id))
 
 	for {
 		select {
 		case <-ctx.Done():
-			w.logger.Info("Worker shutting down", zap.Int("worker_id", workerID))
 			return
-		default:
-		}
-
-		// 尝试开始消费
-		msgChan, err := w.broker.Consume(ctx, w.queueName, brokerConsumeOptions...)
-		if err != nil {
-			// 检测是否是正在重连的错误
-			isReconnecting := errors.Is(err, rabbitmq.ErrBrokerReconnecting)
-
-			w.logger.Error("Failed to start consuming, will retry",
-				zap.Int("worker_id", workerID),
-				zap.String("queue", w.queueName),
-				zap.Error(err),
-				zap.Bool("reconnecting", isReconnecting),
-				zap.Duration("retry_delay", reconnectDelay))
-
-			// 如果是等待重连的错误，给 handleReconnect 更多时间
-			waitDelay := reconnectDelay
-			if isReconnecting {
-				waitDelay = reconnectingDelay
-			}
-
-			// 等待后重试（添加随机抖动避免同步重试）
-			actualDelay := w.addJitter(waitDelay, rng)
-			select {
-			case <-ctx.Done():
+		case t, ok := <-msgChan:
+			if !ok {
+				// Broker 关闭了通道，说明发生了不可恢复的错误或显式关闭
+				w.logger.Warn("Message channel closed", zap.Int("worker_id", id))
 				return
-			case <-time.After(actualDelay):
-				if !isReconnecting {
-					// 指数退避，但不超过最大值
-					reconnectDelay *= 2
-					if reconnectDelay > maxReconnectDelay {
-						reconnectDelay = maxReconnectDelay
-					}
-				}
-				continue
 			}
+			w.processTask(ctx, t)
 		}
-
-		// 成功连接，重置重连延迟
-		reconnectDelay = baseReconnectDelay
-		w.logger.Info("Worker started consuming",
-			zap.Int("worker_id", workerID),
-			zap.String("queue", w.queueName))
-
-		// 处理消息直到通道关闭
-		channelClosed := false
-		for {
-			select {
-			case <-ctx.Done():
-				w.logger.Info("Worker shutting down", zap.Int("worker_id", workerID))
-				return
-			case t, ok := <-msgChan:
-				if !ok {
-					// 消息通道关闭，可能是连接断开
-					w.logger.Warn("Message channel closed, will attempt to reconnect",
-						zap.Int("worker_id", workerID),
-						zap.String("queue", w.queueName))
-					channelClosed = true
-					break
-				}
-				// 使用worker上下文，允许任务取消
-				w.processTask(ctx, t)
-			}
-			if channelClosed {
-				break
-			}
-		}
-
-		// 通道关闭，添加初始延迟避免立即重试（减少惊群效应）
-		// 使用较小的初始延迟 + 随机抖动，让不同 worker 错开重试时间
-		initialDelay := baseReconnectDelay / 2
-		actualDelay := w.addJitter(initialDelay, rng)
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(actualDelay):
-			// 指数退避
-			reconnectDelay *= 2
-			if reconnectDelay > maxReconnectDelay {
-				reconnectDelay = maxReconnectDelay
-			}
-		}
-	}
-}
-
-// addJitter 添加随机抖动到延迟时间，避免多个 worker 同步重试
-// 抖动范围：±25%，例如 1s -> 0.75s-1.25s
-func (w *Worker) addJitter(delay time.Duration, rng *rand.Rand) time.Duration {
-	if delay <= 0 {
-		return delay
-	}
-	// 添加 ±25% 的随机抖动
-	jitter := time.Duration(float64(delay) * 0.25 * (2*rng.Float64() - 1))
-	result := delay + jitter
-	if result < 0 {
-		return delay
-	}
-	return result
-}
-
-// Stop 优雅地停止worker
-func (w *Worker) Stop() {
-	if w.cancel != nil {
-		w.logger.Info("Stopping worker...")
-		w.cancel()
-		w.wg.Wait()
-		w.logger.Info("Worker stopped gracefully")
 	}
 }
 
 func (w *Worker) processTask(ctx context.Context, t *task.Task) {
-	// 添加panic恢复机制
+	// Panic 保护
 	defer func() {
 		if r := recover(); r != nil {
+			stack := getStackTrace()
 			w.logger.Error("Task handler panicked",
-				zap.String("task_name", t.Name),
 				zap.String("task_id", t.ID),
-				zap.Any("panic_value", r),
-				zap.String("stack_trace", getStackTrace()))
+				zap.Any("panic", r),
+				zap.String("stack", stack))
 
-			// 将panic视为任务执行失败，走正常的失败处理流程
-			w.handleTaskFailure(ctx, t, fmt.Errorf("task handler panicked: %v", r))
+			// Panic 视为执行失败
+			w.handleTaskFailure(ctx, t, fmt.Errorf("panic: %v", r))
 		}
 	}()
 
 	handler, ok := w.registry[t.Name]
 	if !ok {
-		w.handleUnknownTask(ctx, t)
+		w.logger.Error("Unknown task type", zap.String("name", t.Name))
+		// 未知任务直接丢弃，不重试
+		_ = w.broker.Nack(ctx, t, false)
 		return
 	}
 
-	w.logTaskStart(t)
+	w.logger.Debug("Processing task", zap.String("id", t.ID), zap.String("name", t.Name))
 
-	// 创建增强的 Context
+	// 构造上下文
 	taskInfo := &deltacontext.TaskInfo{
 		ID:    t.ID,
 		Name:  t.Name,
@@ -268,183 +158,85 @@ func (w *Worker) processTask(ctx context.Context, t *task.Task) {
 	}
 	deltaCtx := deltacontext.New(ctx, t.Payload, taskInfo)
 
+	// 执行业务逻辑
 	_, err := handler(deltaCtx)
 	if err != nil {
-		w.logTaskFailure(t, err)
+		w.logger.Error("Task execution failed", zap.String("id", t.ID), zap.Error(err))
 		w.handleTaskFailure(ctx, t, err)
 	} else {
-		w.handleTaskSuccess(ctx, t)
+		w.logger.Info("Task completed", zap.String("id", t.ID))
+		if ackErr := w.broker.Ack(ctx, t); ackErr != nil {
+			// Ack 失败仅记录日志，由 Broker 重发机制保证至少一次执行
+			w.logger.Warn("Ack failed", zap.String("id", t.ID), zap.Error(ackErr))
+		}
 	}
 }
 
-// handleUnknownTask 处理未注册的任务
-func (w *Worker) handleUnknownTask(ctx context.Context, t *task.Task) {
-	w.logger.Error("No handler registered for task",
-		zap.String("task_name", t.Name),
-		zap.String("task_id", t.ID))
-	if err := w.broker.Nack(ctx, t, false); err != nil { // 不重入队列，直接丢弃
-		w.logger.Error("Failed to Nack unknown task",
-			zap.String("task_id", t.ID),
-			zap.Error(err))
-	}
-}
-
-// handleTaskSuccess 处理任务成功完成
-func (w *Worker) handleTaskSuccess(ctx context.Context, t *task.Task) {
-	w.logger.Info("Task completed",
-		zap.String("task_name", t.Name),
-		zap.String("task_id", t.ID))
-	if err := w.broker.Ack(ctx, t); err != nil {
-		// 如果是连接错误，记录警告但不影响任务处理（任务已经成功执行）
-		// 消息会在连接恢复后由 RabbitMQ 重新投递
-		w.logger.Warn("Failed to Ack successful task (connection may be lost, message will be redelivered)",
-			zap.String("task_id", t.ID),
-			zap.Error(err))
-	}
-}
-
-// logTaskStart 记录任务开始处理的日志
-func (w *Worker) logTaskStart(t *task.Task) {
-	w.logger.Info("Processing task",
-		zap.String("task_name", t.Name),
-		zap.String("task_id", t.ID),
-		zap.Int("retry", t.Retry),
-		zap.Int("max_retries", w.retryPolicy.MaxRetries))
-}
-
-// logTaskFailure 记录任务失败的日志
-func (w *Worker) logTaskFailure(t *task.Task, err error) {
-	w.logger.Error("Task failed",
-		zap.String("task_name", t.Name),
-		zap.String("task_id", t.ID),
-		zap.Error(err))
-}
-
-// handleTaskFailure 处理任务失败，实现重试逻辑
 func (w *Worker) handleTaskFailure(ctx context.Context, t *task.Task, err error) {
-	// 检查是否超过最大重试次数
-	if w.shouldMoveToDeadLetter(t) {
-		w.handleDeadLetterTask(ctx, t)
+	// 检查是否达到最大重试次数
+	if t.Retry >= w.retryPolicy.MaxRetries {
+		w.logger.Error("Max retries reached, dropping task",
+			zap.String("id", t.ID),
+			zap.Int("retries", t.Retry))
+		// 死信处理：直接丢弃
+		_ = w.broker.Nack(ctx, t, false)
 		return
 	}
 
-	// 尝试重试任务
-	w.retryTask(ctx, t)
-}
-
-// shouldMoveToDeadLetter 判断任务是否应该移到死信队列
-func (w *Worker) shouldMoveToDeadLetter(t *task.Task) bool {
-	return t.Retry >= w.retryPolicy.MaxRetries
-}
-
-// handleDeadLetterTask 处理超过最大重试次数的任务
-func (w *Worker) handleDeadLetterTask(ctx context.Context, t *task.Task) {
-	w.logger.Error("Task exceeded max retries, moving to dead letter",
-		zap.String("task_name", t.Name),
-		zap.String("task_id", t.ID),
-		zap.Int("max_retries", w.retryPolicy.MaxRetries))
-
-	// 超过最大重试次数，不重新入队
-	if err := w.broker.Nack(ctx, t, false); err != nil {
-		w.logger.Error("Failed to Nack dead task",
-			zap.String("task_id", t.ID),
-			zap.Error(err))
-	}
-}
-
-// retryTask 重试任务
-func (w *Worker) retryTask(ctx context.Context, t *task.Task) {
-	// 计算重试延迟
+	// 计算延迟并发布重试任务
 	delay := w.calculateRetryDelay(t.Retry)
-
-	// 创建重试任务
-	retryTask := w.createRetryTask(t, delay)
-
-	w.logRetryAttempt(t, delay, retryTask.Retry)
-
-	// 将重试任务发布到同一队列
-	if err := w.broker.Publish(ctx, retryTask, w.queueName); err != nil {
-		w.handleRetryPublishFailure(ctx, t, err)
-		return
-	}
-
-	// 确认原任务（因为我们已经重新发布了）
-	if err := w.broker.Ack(ctx, t); err != nil {
-		// 如果是连接错误，记录警告（重试任务已经发布，原任务会在连接恢复后重新投递）
-		w.logger.Warn("Failed to Ack retried task (connection may be lost, message will be redelivered)",
-			zap.String("task_id", t.ID),
-			zap.Error(err))
-	}
-}
-
-// createRetryTask 创建重试任务
-func (w *Worker) createRetryTask(t *task.Task, delay time.Duration) *task.Task {
-	return &task.Task{
-		ID:        t.ID,
+	retryTask := &task.Task{
+		ID:        t.ID, // 保持 ID 不变，方便追踪
 		Name:      t.Name,
 		Payload:   t.Payload,
 		Retry:     t.Retry + 1,
 		ExecuteAt: time.Now().Add(delay),
 	}
-}
 
-// logRetryAttempt 记录重试尝试的日志
-func (w *Worker) logRetryAttempt(t *task.Task, delay time.Duration, retryCount int) {
-	w.logger.Info("Scheduling retry for task",
-		zap.String("task_name", t.Name),
-		zap.String("task_id", t.ID),
-		zap.Duration("delay", delay),
-		zap.Int("attempt", retryCount),
-		zap.Int("max_retries", w.retryPolicy.MaxRetries))
-}
+	w.logger.Info("Scheduling retry",
+		zap.String("id", t.ID),
+		zap.Int("next_retry", retryTask.Retry),
+		zap.Duration("delay", delay))
 
-// handleRetryPublishFailure 处理重试发布失败的情况
-func (w *Worker) handleRetryPublishFailure(ctx context.Context, t *task.Task, err error) {
-	w.logger.Error("Failed to publish retry task",
-		zap.String("task_id", t.ID),
-		zap.Error(err))
-	// 发布失败，拒绝原任务且不重新入队
-	if nackErr := w.broker.Nack(ctx, t, false); nackErr != nil {
-		w.logger.Error("Failed to Nack failed retry task",
-			zap.String("task_id", t.ID),
-			zap.Error(nackErr))
+	// 先发布，后 Ack
+	if pubErr := w.broker.Publish(ctx, retryTask, w.queueName); pubErr != nil {
+		w.logger.Error("Failed to publish retry task", zap.Error(pubErr))
+
+		// 发布重试任务失败，不能丢弃原任务（Nack false）。
+		//  Nack 并 Requeue (true)，让当前任务立即回到队列头部，
+		// 这样它会被再次消费，再次进入这个流程，直到 Publish 成功。
+		_ = w.broker.Nack(ctx, t, true)
+		return
+	}
+
+	// 发布成功后，Ack 原任务
+	if ackErr := w.broker.Ack(ctx, t); ackErr != nil {
+		w.logger.Warn("Ack failed after retry scheduled", zap.Error(ackErr))
+		// 这里虽然可能导致双重投递（Publish成功但Ack失败），但这是权衡后的最优解。
+		// 业务处理必须幂等。
 	}
 }
 
-// calculateRetryDelay 计算重试延迟时间
 func (w *Worker) calculateRetryDelay(retryCount int) time.Duration {
 	if !w.retryPolicy.Exponential {
 		return w.retryPolicy.BaseDelay
 	}
-
-	// 指数退避：baseDelay * 2^retryCount
-	delay := w.retryPolicy.BaseDelay
-	for range retryCount {
-		delay *= 2
-		if delay > w.retryPolicy.MaxDelay {
-			return w.retryPolicy.MaxDelay
-		}
+	delay := w.retryPolicy.BaseDelay * (1 << retryCount) // 2^retryCount
+	if delay > w.retryPolicy.MaxDelay {
+		return w.retryPolicy.MaxDelay
 	}
-
 	return delay
 }
 
-// getStackTrace 获取当前goroutine的堆栈信息
 func getStackTrace() string {
 	const maxStackFrames = 32
 	var stack [maxStackFrames]uintptr
-
-	// 获取调用栈
-	n := runtime.Callers(3, stack[:]) // 跳过前3层调用（runtime.Callers, getStackTrace, defer函数）
-
+	n := runtime.Callers(3, stack[:])
 	if n == 0 {
-		return "no stack trace available"
+		return ""
 	}
-
-	// 构建堆栈字符串
-	var result string
 	frames := runtime.CallersFrames(stack[:n])
-
+	var result string
 	for {
 		frame, more := frames.Next()
 		result += fmt.Sprintf("\n\t%s:%d", frame.Function, frame.Line)
@@ -452,6 +244,5 @@ func getStackTrace() string {
 			break
 		}
 	}
-
 	return result
 }

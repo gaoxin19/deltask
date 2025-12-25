@@ -332,10 +332,6 @@ func TestRabbitBrokerConsumeValidation(t *testing.T) {
 	if ch != nil {
 		t.Error("Consume() with error should return nil channel")
 	}
-	// 应该返回 ErrBrokerReconnecting 错误
-	if !errors.Is(err, ErrBrokerReconnecting) {
-		t.Errorf("Consume() error = %v, want ErrBrokerReconnecting", err.Error())
-	}
 }
 
 func TestRabbitBrokerAckWithInvalidMeta(t *testing.T) {

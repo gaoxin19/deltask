@@ -125,6 +125,11 @@ func (w *Worker) Register(taskName string, handler task.Handler) {
 	w.w.Register(taskName, handler)
 }
 
+// QueueName 返回 Worker 监听的队列名称
+func (w *Worker) QueueName() string {
+	return w.w.QueueName()
+}
+
 // Run 启动 Worker 开始消费和处理任务。
 // 这是一个阻塞操作，它会一直运行直到传入的 context 被取消。
 // 它会处理优雅关闭逻辑。
