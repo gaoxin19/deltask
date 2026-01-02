@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -179,7 +180,14 @@ func (b *rabbitBroker) handleReconnect(conn *amqp.Connection) {
 	closeChan := conn.NotifyClose(make(chan *amqp.Error, 1))
 
 	err := <-closeChan
-	if err == nil {
+
+	// 只有当 b.isClosed 为 true 时（用户调用 Close），才停止重连。
+	// 即使 err == nil (可能是为了杀掉僵尸连接而强制 Close 的)，也要重连。
+	b.mu.RLock()
+	intentionalClose := b.isClosed
+	b.mu.RUnlock()
+
+	if intentionalClose {
 		return // 主动关闭
 	}
 
@@ -324,6 +332,12 @@ func (b *rabbitBroker) Publish(ctx context.Context, t *task.Task, queueName stri
 	if err != nil {
 		// 发生错误，Channel 可能已废弃，直接关闭，不放回池子
 		_ = ch.Close()
+
+		// 主动杀掉僵尸连接
+		if isChannelError(err) {
+			b.checkAndKillZombieConnection(err)
+		}
+
 		return fmt.Errorf("amqp publish error: %w", err)
 	}
 
@@ -371,6 +385,14 @@ func (b *rabbitBroker) Consume(ctx context.Context, queueName string, opts ...br
 			if err := b.setupTopology(ch, prefixedQ, options.PrefetchCount); err != nil {
 				b.logger.Error("Failed to setup topology, retrying...", zap.Error(err))
 				_ = ch.Close()
+
+				// 主动杀掉僵尸连接
+				// 如果拓扑设置失败（如 declare queue 报 connection not open），
+				// 但 waitForConnection 认为连接是好的，说明是僵尸连接，必须杀掉触发重连。
+				if isChannelError(err) {
+					b.checkAndKillZombieConnection(err)
+				}
+
 				time.Sleep(3 * time.Second)
 				continue
 			}
@@ -379,6 +401,9 @@ func (b *rabbitBroker) Consume(ctx context.Context, queueName string, opts ...br
 			if err != nil {
 				b.logger.Error("Failed to start consuming, retrying...", zap.Error(err))
 				_ = ch.Close()
+				if isChannelError(err) {
+					b.checkAndKillZombieConnection(err)
+				}
 				time.Sleep(3 * time.Second)
 				continue
 			}
@@ -473,6 +498,21 @@ func (b *rabbitBroker) waitForConnection(ctx context.Context) error {
 	}
 }
 
+// checkAndKillZombieConnection 检测是否是僵尸连接并强制关闭
+func (b *rabbitBroker) checkAndKillZombieConnection(err error) {
+	b.mu.RLock()
+	conn := b.conn
+	b.mu.RUnlock()
+
+	// 如果收到连接级错误，但客户端对象认为连接是 Open 的
+	// 这是一个僵尸连接，必须强制 Close 才能触发 NotifyClose，进而触发 handleReconnect
+	if conn != nil && !conn.IsClosed() {
+		b.logger.Warn("Detected zombie connection (client thinks open, ops failed), forcing close", zap.Error(err))
+		// 强制关闭。这会发送 nil/error 给 NotifyClose channel
+		_ = conn.Close()
+	}
+}
+
 func (b *rabbitBroker) Ack(ctx context.Context, t *task.Task) error {
 	delivery, ok := t.BrokerMeta.(amqp.Delivery)
 	if !ok {
@@ -518,4 +558,17 @@ func (b *rabbitBroker) Close() error {
 
 func (b *rabbitBroker) prefixed(name string) string {
 	return fmt.Sprintf("%s.%s", b.config.Namespace, name)
+}
+
+func isChannelError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "channel/connection is not open") ||
+		strings.Contains(errStr, "channel error") ||
+		strings.Contains(errStr, "connection closed") ||
+		strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "socket closed") ||
+		errors.Is(err, amqp.ErrClosed)
 }
